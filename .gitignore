@@ -1,0 +1,27 @@
+# by default exclude anythign in jevents without an extension since it's
+# probably a binary file
+/jevents/**
+!/jevents/**/
+!/jevents/**/*.*
+!/jevents/**/Makefile
+
+/.*
+!.gitignore
+*.o
+*.a
+*.log
+__pycache__
+/tmp/*
+*.d
+/out*
+
+# exes
+/test
+/bench
+/voltmon
+
+perf.data
+perf.data.*
+
+/results
+/temp
