@@ -325,6 +325,7 @@ static argsw::Flag arg_verbose{parser, "verbose", "Output more info", {"verbose"
 static argsw::Flag arg_nobarrier{parser, "no-barrier", "Don't sync up threads before each test (debugging only)", {"no-barrier"}};
 static argsw::Flag arg_list{parser, "list", "List the available tests and their descriptions", {"list"}};
 static argsw::Flag arg_csv{parser, "", "Output a csv table instead of the default", {"csv"}};
+static argsw::Flag arg_progress{parser, "", "Display progress to stdout", {"progress"}};
 
 static argsw::Flag arg_hyperthreads{parser, "allow-hyperthreads", "By default we try to filter down the available cpus to include only physical cores, but "
     "with this option we'll use all logical cores meaning you'll run two tests on cores with hyperthreading", {"allow-hyperthreads"}};
@@ -750,6 +751,7 @@ int main(int argc, char** argv) {
     fmt::print(out, "get_nprocs()         : [{}]\n", get_nprocs());
     fmt::print(out, "iterations           : [{}]\n", iters);
 
+    auto min_threads = arg_min_threads.Get();
     auto max_threads = arg_max_threads ? arg_max_threads.Get() : cpus.size();
 
     std::vector<test_func> specs;
@@ -766,7 +768,7 @@ int main(int argc, char** argv) {
 
     std::vector<result_holder> results_list;
     for (auto func : specs) {
-        for (size_t count = arg_min_threads.Get(); count <= max_threads; count++) {
+        for (size_t count = min_threads; count <= max_threads; count++) {
 
             const bool has_check = func.check_func;
             uint64_t counter_before = has_check ? func.check_func() : 0;
@@ -796,6 +798,11 @@ int main(int argc, char** argv) {
             if (has_check && total_counter_delta != total_iters) {
                 throw std::runtime_error(fmt::format("threads {}, algo {} failed check: {} actual vs {} expected",
                         count, func.id, total_counter_delta, total_iters));
+            }
+
+            if (arg_progress) {
+                fmt::print(stderr, "Finished {} of {} benchmarks\n", results_list.size(), specs.size() *
+                        (max_threads - min_threads + 1));
             }
         }
     }
