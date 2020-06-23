@@ -9,25 +9,35 @@ EXE := bench
 
 CXX ?= g++
 CC ?= gcc
-ASM ?= nasm
-ASM_FLAGS ?= -DNASM_ENABLE_DEBUG=$(NASM_DEBUG) -w+all
-
-ARCH_FLAGS := -march=$(CPU_ARCH)
-
 
 # make submakes use the specified compiler also
 export CXX
 export CC
 
+# any file that is only conditionally compiled goes here,
+# we filter it out from the wildcard below and then add
+# it back in using COND_SRC, which gets built up based
+# on various conditions
+CONDSRC_MASTER := tsc-support.cpp cpuid.cpp
+CONDSRC :=
+
+ifneq ($(USE_RDTSC),0)
+CONDSRC += tsc-support.cpp cpuid.cpp
+endif
+
+DEFINES = -DUSE_RDTSC=$(USE_RDTSC)
+
 INCLUDES += -Ifmt/include
+
+ARCH_FLAGS := $(MARCH_ARG)=$(CPU_ARCH)
 
 COMMON_FLAGS := -MMD -Wall $(ARCH_FLAGS) -g $(O_LEVEL) $(INCLUDES) $(NDEBUG)
 
-CPPFLAGS +=
-CFLAGS += $(COMMON_FLAGS)
-CXXFLAGS += $(COMMON_FLAGS) -Wno-unused-variable 
+CFLAGS   += $(DEFINES) $(COMMON_FLAGS)
+CXXFLAGS += $(DEFINES) $(COMMON_FLAGS) -Wno-unused-variable
 
 SRC_FILES := $(wildcard *.cpp) $(wildcard *.c) fmt/src/format.cc
+SRC_FILES := $(filter-out $(CONDSRC_MASTER), $(SRC_FILES)) $(CONDSRC)
 
 # on most compilers we should use no-pie since the nasm stuff isn't position independent
 # but since old compilers don't support it, you can override it with PIE= on the command line
@@ -42,8 +52,6 @@ OBJECTS := $(OBJECTS:.c=.o)
 DEPFILES = $(OBJECTS:.o=.d)
 # $(info OBJECTS=$(OBJECTS))
 
-# VPATH = test:$(PSNIP_DIR)/cpu
-
 ###########
 # Targets #
 ###########
@@ -53,12 +61,12 @@ all: bench
 -include $(DEPFILES)
 
 clean:
-	rm -f *.d *.o $(EXE)
+	find -name '*.o' -delete
+	find -name '*.d' -delete
+	rm -f $(EXE)
 
 $(EXE): $(OBJECTS) $(EXTRA_DEPS)
 	$(CXX) $(OBJECTS) $(CPPFLAGS) $(CXXFLAGS) $(LDFLAGS) $(LDLIBS)  -o $@
-
-util/seqtest: util/seqtest.o
 
 %.o : %.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
@@ -72,7 +80,9 @@ util/seqtest: util/seqtest.o
 
 LOCAL_MK = $(wildcard local.mk)
 
+ifndef MAKE_CLEAN_RECURSION
 # https://stackoverflow.com/a/3892826/149138
 dummy.rebuild: Makefile config.mk $(LOCAL_MK)
 	touch $@
-	$(MAKE) -s clean
+	$(MAKE) -s clean MAKE_CLEAN_RECURSION=1
+endif

@@ -2,8 +2,16 @@
 
 #include <linux/futex.h>
 #include <unistd.h>
-#include <immintrin.h>
 #include <sys/syscall.h>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+inline void cpu_relax() { _mm_pause(); }
+#elif defined(__aarch64__)
+inline void cpu_relax() { asm volatile ("yield"); }
+#else
+inline void cpu_relax() {}
+#endif
 
 using namespace locks;
 
@@ -12,22 +20,22 @@ void spin_base::unlock() {
 }
 
 template <typename S>
-static inline void spin_impl(std::atomic<bool>& islocked, S spinner) {
+static inline void spin_impl(std::atomic<bool>& is_locked, S spinner) {
     do {
-        while (islocked.load(std::memory_order_relaxed)) {
+        while (is_locked.load(std::memory_order_relaxed)) {
             spinner();
         }
-    } while (islocked.exchange(true, std::memory_order_acquire));
+    } while (is_locked.exchange(true, std::memory_order_acquire));
 }
 
 void spinlock_hot::lock() { spin_impl(islocked, []{}); }
 
-void spinlock_pause::lock() { spin_impl(islocked, []{ _mm_pause(); }); }
+void spinlock_pause::lock() { spin_impl(islocked, cpu_relax); }
 
 void spinlock_yield::lock() { spin_impl(islocked, []{ sched_yield(); }); }
 
 void blocking_ticket::lock() {
-    auto ticket = dispenser++;
+    auto ticket = dispenser.fetch_add(1, std::memory_order_relaxed);
 
     if (ticket == serving.load(std::memory_order_acquire))
         return;
@@ -108,6 +116,7 @@ int futex(int* uaddr, int futex_op, int val, const struct timespec* timeout,
 
 void futex_wait(int* futex_addr, int val) {
     int ret = futex(futex_addr, FUTEX_WAIT, val, NULL, NULL, 0);
+    (void)ret;
     assert(ret == 0 || (ret == -1 && errno == EAGAIN));
 }
 
@@ -119,23 +128,16 @@ void futex_wake(int* futex_addr, int nwait) {
     }
 }
 
-static thread_local int tid = gettid();
-
 void mutex3::lock() {
     int c;
     if ((c = cmpxchg(val, 0, 1)) != 0) {
         if (c != 2) {
             c = xchg(val, 2);
-            // printf("%d xchg %d\n", tid, c);
         }
         while (c != 0) {
-            // printf("%d wait %d\n", tid, val);
             futex_wait(&val, 2);
             c = xchg(val, 2);
         }
-        // printf("%d lock slow\n", tid);
-    } else {
-        // printf("%d lock fast %d\n", tid, c);
     }
 }
  

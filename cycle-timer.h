@@ -40,7 +40,7 @@ cl_timepoint cl_now();
 
 /*
  * Return the interval between timepoints first and second.
- * This value is positive iff second occus after first.
+ * This value is positive iff second occurs after first.
  */
 static inline cl_interval cl_delta(cl_timepoint first, cl_timepoint second) {
     return (cl_interval){second.nanos - first.nanos};
@@ -59,11 +59,11 @@ double cl_to_nanos(cl_interval interval);
  * the cycle to nanoseconds value (i.e., the CPU frequency). You never *need* to
  * use this function, if you haven't call it, it will happens automatically when
  * init is necessary (usually lazily - when accessing the cl_to_cycles),
- * but may be lengthy, so this method is offfered so that the user can trigger
+ * but may be lengthy, so this method is offered so that the user can trigger
  * it at a time of their choosing (and allowing the user to elect whether to
  * print out diagnostic information about the calibration).
  *
- * If you pass true for print, dignostic information like the detected CPU
+ * If you pass true for print, diagnostic information like the detected CPU
  * frequency is printed to stderr.
  */
 void cl_init(bool print);

@@ -2,40 +2,42 @@
  * bench.cpp
  */
 
-#include "args.hxx"
-#include "fairlocks.hpp"
-#include "stats.hpp"
-#include "table.hpp"
-#include "tsc-support.hpp"
-#include "util.hpp"
-#include "hedley.h"
-#include "fmt/format.h"
+#include <err.h>
+#include <error.h>
+#include <sched.h>
+#include <sys/sysinfo.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include <array>
 #include <atomic>
-#include <deque>
 #include <cassert>
-#include <cstdlib>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <set>
-#include <functional>
 #include <thread>
 #include <vector>
 
-#include <error.h>
-#include <err.h>
-#include <sched.h>
-#include <sys/types.h>
-#include <sys/sysinfo.h>
-#include <unistd.h>
+#include "args-wrap.hpp"
+#include "fairlocks.hpp"
+#include "fmt/format.h"
+#include "hedley.h"
+#include "stats.hpp"
+#include "table.hpp"
+#include "util.hpp"
 
-
-#define MSR_IA32_MPERF 0x000000e7
-#define MSR_IA32_APERF 0x000000e8
+#if USE_RDTSC
+#include "tsc-support.hpp"
+#define DefaultClock RdtscClock
+#else
+#define DefaultClock StdClock<std::chrono::high_resolution_clock>
+#endif
 
 using std::uint64_t;
 using namespace std::chrono;
@@ -62,20 +64,77 @@ struct test_func {
     check_f* rac_func;
 };
 
-static volatile thread_local uint64_t tls_counter;
-static std::atomic<uint64_t> tls_accumulator;
+/**
+ * Keeps a counter per thread, readers need to sum
+ * the counters from all active threads and add the
+ * accumulated value from dead threads.
+ */
+class tls_counter {
+    std::atomic<uint64_t> counter{0};
 
-uint64_t tls_add(size_t iters) {
-    uint64_t rac_count = 0;
-    IF_RAC(uint64_t last = tls_counter - 1;)
-    while (iters--) {
-        auto cur = tls_counter++;
-        IF_RAC(rac_count += (cur == last + 1); last = cur;)
+    /* protects all_counters */
+    static std::mutex lock;
+    /* list of all active counters */
+    static std::vector<tls_counter *> all_counters;
+    /* accumulated value of counters from dead threads */
+    static std::atomic<uint64_t> accumulator;
+    /* per-thread tls_counter object */
+    static thread_local tls_counter tls;
+
+    /** add ourself to the counter list */
+    tls_counter() {
+        std::lock_guard<std::mutex> g(lock);
+        all_counters.push_back(this);
     }
-    return rac_count;
+
+    /**
+     * destruction means the thread is going away, so
+     * we stash the current value in the accumulator and
+     * remove ourselves from the array
+     */
+    ~tls_counter() {
+        std::lock_guard<std::mutex> g(lock);
+        accumulator += counter.load(std::memory_order_relaxed);
+        all_counters.erase(std::remove(all_counters.begin(), all_counters.end(), this), all_counters.end());
+    }
+
+    void incr() {
+        auto cur = counter.load(std::memory_order_relaxed);
+        counter.store(cur + 1, std::memory_order_relaxed);
+    }
+
+public:
+
+    static uint64_t read() {
+        std::lock_guard<std::mutex> g(lock);
+        uint64_t sum = 0, count = 0;
+        for (auto h : all_counters) {
+            sum += h->counter.load(std::memory_order_relaxed);
+            count++;
+        }
+        return sum + accumulator;
+    }
+
+    HEDLEY_NEVER_INLINE
+    static void increment() {
+        tls.incr();
+    }
+};
+
+std::mutex tls_counter::lock;
+std::vector<tls_counter *> tls_counter::all_counters;
+std::atomic<uint64_t> tls_counter::accumulator;
+thread_local tls_counter tls_counter::tls;
+
+HEDLEY_NEVER_INLINE
+uint64_t tls_add(size_t iters) {
+    while (iters--) {
+        tls_counter::increment();
+    }
+    return 0;
 }
 
-static volatile uint64_t plain_counter; 
+static volatile uint64_t plain_counter;
 // racy
 uint64_t plain_add(size_t iters) {
     uint64_t rac_count = 0;
@@ -87,72 +146,105 @@ uint64_t plain_add(size_t iters) {
     return rac_count;
 }
 
-
-std::atomic<uint64_t> atomic_counter{};
-
-uint64_t atomic_add(size_t iters) {
-    uint64_t rac_count = 0;
-    IF_RAC(uint64_t last = atomic_counter.load() - 1;)
-    while (iters--) {
-        auto cur = atomic_counter++;
-        IF_RAC(rac_count += (cur == last + 1); last = cur;)
+/**
+ * Simple counter which just uses a relaxed std::atomic increment.
+ */
+class atomic_add_counter {
+    std::atomic<uint64_t> counter{};
+public:
+    uint64_t operator++(int) {
+        return counter.fetch_add(1, std::memory_order_relaxed);
     }
-    return rac_count;
-}
 
-std::atomic<uint64_t> cas_counter;
+    uint64_t read() const {
+        return counter.load(std::memory_order_relaxed);
+    }
+};
 
-uint64_t cas_add(size_t iters) {
-    uint64_t rac_count = 0;
-    IF_RAC(uint64_t last = cas_counter.load() - 1;)
-    while (iters--) {
-        auto cur = cas_counter.load();
-        while (!cas_counter.compare_exchange_weak(cur, cur + 1))
+atomic_add_counter atomic_counter;
+
+class atomic_cas_counter {
+    std::atomic<uint64_t> counter{0};
+public:
+    uint64_t operator++(int) {
+        auto cur = counter.load();
+        while (!counter.compare_exchange_weak(cur, cur + 1))
             ;
-        IF_RAC(rac_count += (cur == last + 1); last = cur;)
+        return cur;
     }
-    return rac_count;
-}
+
+    uint64_t read() const {
+        return counter.load(std::memory_order_relaxed);
+    }
+};
+
+atomic_cas_counter cas_counter;
 
 struct multi_holder {
     alignas(64) std::atomic<uint64_t> counter;
 };
 
-constexpr size_t MULTI_MAX  = 64;
-constexpr size_t MULTI_MASK = MULTI_MAX - 1;
-static_assert((MULTI_MAX & MULTI_MASK) == 0, "MULTI_MAX must be a power of 2");
+/**
+ * Uses a total of NUM_COUNTERS to represent the count, allowing
+ * the different CPUs to use different. CAS failure is used as the
+ * hint that two CPUs are concurrently sharing a counter slot and
+ * so we should adjust the index.
+ */
+class cas_multi_counter {
+    static constexpr size_t NUM_COUNTERS = 64;
+    static thread_local size_t idx;
 
-static thread_local size_t multi_idx;
-static multi_holder multi_array[MULTI_MAX];
+    multi_holder array[NUM_COUNTERS];
 
-uint64_t cas_multi(size_t iters) {
-    uint64_t rac_count = 0;
-    // size_t contention = 0;
-    auto& counter = multi_array[multi_idx].counter;
-    IF_RAC(uint64_t last = counter.load() - 1;)
-    while (iters--) {
-        auto cur = counter.load();
+public:
 
-        if (counter.compare_exchange_weak(cur, cur + 1)) {
-            continue;
+    /** increment the logical counter value */
+    uint64_t operator++(int) {
+        while (true) {
+            auto& counter = array[idx].counter;
+
+            auto cur = counter.load();
+            if (counter.compare_exchange_strong(cur, cur + 1)) {
+                return cur;
+            }
+
+            // CAS failure indicates contention,
+            // so try again at a different index
+            idx = (idx + 1) % NUM_COUNTERS;
         }
+    }
 
-        multi_idx = (multi_idx + 1) & MULTI_MASK;
+    /**
+     * Read the current value of the counter by summing all
+     * physical counters.
+     */
+    uint64_t read() {
+        uint64_t sum = 0;
+        for (auto& h : array) {
+            sum += h.counter.load();
+        }
+        return sum;
+    }
+};
 
-        while (!counter.compare_exchange_weak(cur, cur + 1))
-            ;
+thread_local size_t cas_multi_counter::idx;
+
+cas_multi_counter cas_mc;
+
+/**
+ * Generic benchmark method for objects that offer ++ and read() methods.
+ * @param iters number of iterations to run the benchmark
+ * @return the rac count: the number of times increments were consecutive
+ */
+template <typename T>
+uint64_t bench_template(T& counter, size_t iters) {
+    uint64_t rac_count = 0;
+    IF_RAC(uint64_t last = counter.read() - 1;)
+    while (iters--) {
+        auto cur = counter++;
         IF_RAC(rac_count += (cur == last + 1); last = cur;)
     }
-
     return rac_count;
-}
-
-uint64_t cas_multi_read() {
-    uint64_t sum = 0;
-    for (auto& h : multi_array) {
-        sum += h.counter.load(std::memory_order_relaxed);
-    }
-    return sum;
 }
 
 // template for any bench which just uses a lock around
@@ -185,44 +277,35 @@ alignas(64) T adaptor<T>::lock;
 template <typename T>
 uint64_t adaptor<T>::counter;
 
-
-void per_thread_init() {
-    
-}
-
-void per_thread_deinit() {
-    tls_accumulator += tls_counter;
-}
-
-
-uint64_t read_tls_counters() {
-    return tls_accumulator.load();
-}
-
 /** make a test_func object from adaptor<T> using the given lock type T */
 template <typename T>
-test_func make(const char *name, const char* desc = "desc") {
+test_func make_from_lock(const char *name, const char* desc = "desc") {
     return { adaptor<T>::bench, name, desc, adaptor<T>::get_counter };
 }
 
+template <typename T, T* O>
+test_func make_from_type(const char *name) {
+    return { [](size_t i) { return bench_template(*O, i); } , name , "desc" , []{ return O->read(); } };
+}
+
 std::vector<test_func> ALL_FUNCS = {
-    {plain_add                                      , "plain add"  , "desc" , nullptr }                             ,
-    {tls_add                                        , "tls add"    , "desc" , read_tls_counters }                   ,
-    {atomic_add                                     , "atomic add" , "desc" , []{ return atomic_counter.load(); } } ,
-    {cas_add                                        , "cas add"    , "desc" , []{ return cas_counter.load(); } }    ,
-    {cas_multi                                      , "cas multi"  , "desc" , cas_multi_read }    ,
-    make<std::mutex>("mutex add")                   ,
-    make<locks::spinlock_hot>("pure spin")          ,
-    make<locks::spinlock_pause>("pause spin")       ,
-    make<locks::spinlock_yield>("yield spin")       ,
-    make<locks::ticket_spin>("ticket spin")         ,
-    make<locks::yielding_spin>("ticket yield")      ,
-    make<locks::blocking_ticket>("ticket blocking") ,
-    make<locks::fifo_queued>("queued fifo")         ,
-    make<locks::mutex3>("mutex3")                   ,
+        {plain_add                                      , "plain add"  , "desc" , nullptr }                             ,
+        {tls_add                                        , "tls add"    , "desc" , tls_counter::read }                   ,
+        make_from_type<atomic_add_counter, &atomic_counter>("atomic add"),
+        make_from_type<atomic_cas_counter, &cas_counter>("cas add"),
+        make_from_type<cas_multi_counter, &cas_mc>("cas multi"),
+        make_from_lock<std::mutex>("mutex add")                   ,
+        make_from_lock<locks::spinlock_hot>("pure spin")          ,
+        make_from_lock<locks::spinlock_pause>("pause spin")       ,
+        make_from_lock<locks::spinlock_yield>("yield spin")       ,
+        make_from_lock<locks::ticket_spin>("ticket spin")         ,
+        make_from_lock<locks::ticket_yield>("ticket yield")      ,
+        make_from_lock<locks::blocking_ticket>("ticket blocking") ,
+        make_from_lock<locks::fifo_queued>("queued fifo")         ,
+        make_from_lock<locks::mutex3>("mutex3")                   ,
 };
 
-void pin_to_cpu(int cpu) {
+static void pin_to_cpu(int cpu) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(cpu, &cpuset);
@@ -232,28 +315,31 @@ void pin_to_cpu(int cpu) {
 }
 
 /** args */
-static args::ArgumentParser parser{"conc-bench: Demonstrate concurrency perforamnce levels"};
-static args::HelpFlag help{parser, "help", "Display this help menu", {'h', "help"}};
-static args::Flag arg_force_tsc_cal{parser, "force-tsc-calibrate",
+static argsw::ArgumentParser parser{"conc-bench: Demonstrate concurrency perforamnce levels"};
+static argsw::HelpFlag help{parser, "help", "Display this help menu", {"help"}};
+static argsw::Flag arg_force_tsc_cal{parser, "force-tsc-calibrate",
     "Force manual TSC calibration loop, even if cpuid TSC Hz is available", {"force-tsc-calibrate"}};
-static args::Flag arg_no_pin{parser, "no-pin",
+static argsw::Flag arg_no_pin{parser, "no-pin",
     "Don't try to pin threads to CPU - gives worse results but works around affinity issues on TravisCI", {"no-pin"}};
-static args::Flag arg_verbose{parser, "verbose", "Output more info", {"verbose"}};
-static args::Flag arg_nobarrier{parser, "no-barrier", "Don't sync up threads before each test (debugging only)", {"no-barrier"}};
-static args::Flag arg_list{parser, "list", "List the available tests and their descriptions", {"list"}};
-static args::Flag arg_csv{parser, "", "Output a csv table instead of the default", {"csv"}};
+static argsw::Flag arg_verbose{parser, "verbose", "Output more info", {"verbose"}};
+static argsw::Flag arg_nobarrier{parser, "no-barrier", "Don't sync up threads before each test (debugging only)", {"no-barrier"}};
+static argsw::Flag arg_list{parser, "list", "List the available tests and their descriptions", {"list"}};
+static argsw::Flag arg_csv{parser, "", "Output a csv table instead of the default", {"csv"}};
 
-static args::Flag arg_hyperthreads{parser, "allow-hyperthreads", "By default we try to filter down the available cpus to include only physical cores, but "
+static argsw::Flag arg_hyperthreads{parser, "allow-hyperthreads", "By default we try to filter down the available cpus to include only physical cores, but "
     "with this option we'll use all logical cores meaning you'll run two tests on cores with hyperthreading", {"allow-hyperthreads"}};
-static args::ValueFlag<std::string> arg_algos{parser, "TEST-ID", "Run only the algorithms in the comma separated list", {"algos"}};
-static args::ValueFlag<size_t> arg_iters{parser, "ITERS", "Run the test loop ITERS times (default 100000)", {"iters"}, 100000};
-static args::ValueFlag<int> arg_min_threads{parser, "MIN", "The minimum number of threads to use", {"min-threads"}, 1};
-static args::ValueFlag<int> arg_max_threads{parser, "MAX", "The maximum number of threads to use", {"max-threads"}};
-static args::ValueFlag<uint64_t> arg_warm_ms{parser, "MILLISECONDS", "Warmup milliseconds for each thread after pinning (default 100)", {"warmup-ms"}, 100};
+static argsw::ValueFlag<std::string> arg_algos{parser, "TEST-ID", "Run only the algorithms in the comma separated list", {"algos"}};
+static argsw::ValueFlag<size_t> arg_iters{parser, "ITERS", "Run the test loop ITERS times (default 100000)", {"iters"}, 10};
+static argsw::ValueFlag<int> arg_min_threads{parser, "MIN", "The minimum number of threads to use", {"min-threads"}, 1};
+static argsw::ValueFlag<int> arg_max_threads{parser, "MAX", "The maximum number of threads to use", {"max-threads"}};
+static argsw::ValueFlag<uint64_t> arg_warm_ms{parser, "MILLISECONDS", "Warmup milliseconds for each thread after pinning (default 100)", {"warmup-ms"}, 100};
 
 
 bool verbose;
 
+/**
+ * Clock that uses std::chrono clocks.
+ */
 template <typename CHRONO_CLOCK>
 struct StdClock {
     using now_t   = decltype(CHRONO_CLOCK::now());
@@ -264,11 +350,21 @@ struct StdClock {
     }
 
     /* accept the result of subtraction of durations and convert to nanos */
-    static uint64_t to_nanos(typename CHRONO_CLOCK::duration d) {
+    static uint64_t to_nanos(delta_t d) {
         return duration_cast<std::chrono::nanoseconds>(d).count();
+    }
+
+    static uint64_t now_to_nanos(now_t tp) {
+        return to_nanos(tp.time_since_epoch());
     }
 };
 
+#if USE_RDTSC
+/**
+ * Clock that uses rdtsc if available. Generally
+ * someone faster than the std::chrono clocks and
+ * plenty accurate on any modern x86 machine.
+ */
 struct RdtscClock {
     using now_t   = uint64_t;
     using delta_t = uint64_t;
@@ -281,9 +377,13 @@ struct RdtscClock {
     }
 
     /* accept the result of subtraction of durations and convert to nanos */
-    static uint64_t to_nanos(now_t diff) {
+    static uint64_t now_to_nanos(now_t diff) {
         static double tsc_to_nanos = 1000000000.0 / tsc_freq();
         return diff * tsc_to_nanos;
+    }
+
+    static uint64_t to_nanos(delta_t diff) {
+        return now_to_nanos(diff);
     }
 
     static uint64_t tsc_freq() {
@@ -293,23 +393,12 @@ struct RdtscClock {
 
 };
 
-/**
- * We pass an outer_clock to run_test which times outside the iteration of the innermost loop (i.e.,
- * it times around the loop that runs TRIES times), start should reset the state unless you want to
- * time warmup iterations.
- */
-struct outer_timer {
-    virtual void start() = 0;
-    virtual void stop() = 0;
-    virtual ~outer_timer() {}
-};
+#endif
 
-struct dummy_outer : outer_timer {
-    static dummy_outer dummy;
-    virtual void start() override {};
-    virtual void stop() override {};
-};
-dummy_outer dummy_outer::dummy{};
+template <typename CLOCK = DefaultClock>
+static uint64_t now_nanos() {
+    return CLOCK::now_to_nanos(CLOCK::now());
+}
 
 /*
  * The result of the run_test method, with only the stuff
@@ -362,38 +451,35 @@ struct hot_barrier {
 
 
 template <typename CLOCK, size_t TRIES = 17, size_t WARMUP = 2>
-inner_result run_test(cal_f* func, size_t iters, outer_timer& outer, hot_barrier *barrier) {
+inner_result run_test(cal_f* func, size_t iters, hot_barrier *barrier) {
 
     std::array<typename CLOCK::delta_t, TRIES> results;
 
     inner_result result;
 
-    result.ostart_ts = RdtscClock::now();
+    result.ostart_ts = now_nanos();
     for (size_t w = 0; w < WARMUP + 1; w++) {
         uint64_t reacquires = 0;
-        result.istart_ts = RdtscClock::now();
-        outer.start();
+        result.istart_ts = now_nanos();
         for (size_t r = 0; r < TRIES; r++) {
             auto t0 = CLOCK::now();
             reacquires += func(iters);
             auto t1 = CLOCK::now();
             results[r] = t1 - t0;
         }
-        outer.stop();
-        result.iend_ts = RdtscClock::now();
+        result.iend_ts = now_nanos();
         result.reacquires = reacquires;
     }
 
-    result.oend_ts1 = RdtscClock::now();
+    result.oend_ts1 = now_nanos();
 
     // this loop keeps running the test function until all other
     // threads are done too, to keep the environment consistent
-    // printf("%d at barrier\n", gettid());
     for (barrier->increment(); !barrier->is_broken();) {
         func(iters);
         result.total_iters += iters;
     }
-    result.oend_ts2 = RdtscClock::now();
+    result.oend_ts2 = now_nanos();
 
     result.timed_iters = TRIES * iters;
     result.total_iters += (WARMUP + 1) * TRIES * iters;
@@ -472,12 +558,12 @@ struct result_holder {
 
 struct warmup {
     uint64_t millis;
-    warmup(uint64_t millis) : millis{millis} {}
+    explicit warmup(uint64_t millis) : millis{millis} {}
 
     long warm() {
-        int64_t start = (int64_t)RdtscClock::now();
+        int64_t start = (int64_t)now_nanos();
         long iters = 0;
-        while (RdtscClock::to_nanos(RdtscClock::now() - start) < 1000000u * millis) {
+        while ((now_nanos() - start) < 1000000u * millis) {
             iters++;
         }
         return iters;
@@ -503,7 +589,7 @@ struct test_thread {
         id{id}, cpu{cpu}, start_barrier{&start_barrier}, stop_barrier{&stop_barrier}, test{test},
         iters{iters}, thread{std::ref(*this)}
     {
-        // if (verbose) printf("Constructed test in thread %lu, this = %p\n", id, this);
+        if (verbose) fmt::print("Constructed test in thread {}, this = {}\n", id, (void *)this);
     }
 
     test_thread(const test_thread&) = delete;
@@ -511,43 +597,26 @@ struct test_thread {
     void operator=(const test_thread&) = delete;
 
     void operator()() {
-        per_thread_init();
-
-        // if (verbose) printf("Running test in thread %lu, this = %p\n", id, this);
         if (cpu >= 0) {
             pin_to_cpu(cpu);
         }
-        outer_timer& outer = dummy_outer::dummy;
         warmup w{arg_warm_ms.Get()};
         long warms = w.warm();
-        if (verbose) printf("[%2lu] Warmup iters %lu\n", id, warms);
+        if (verbose) fmt::print("{:2} Warmup iters {}\n", id, warms);
         if (!arg_nobarrier) {
             long count = start_barrier->wait();
-            if (verbose) printf("[%2lu] Thread loop count: %ld\n", id, count);
+            if (verbose) fmt::print("{:2} Thread loop count: {}\n", id, count);
         }
-        res.start_ts = RdtscClock::now();
-        res.inner = run_test<RdtscClock>(test.func, iters, outer, stop_barrier);
-        res.end_ts = RdtscClock::now();
-
-        per_thread_deinit();
+        res.start_ts = now_nanos();
+        res.inner = run_test<DefaultClock>(test.func, iters, stop_barrier);
+        res.end_ts = now_nanos();
     }
 };
-
-
-// TODO remove
-void phelper(const char *msg, uint64_t start, uint64_t end) {
-    printf("%s: %zu\n", msg, RdtscClock::to_nanos(end - start));
-}
 
 template <typename E>
 double aggregate_results(const std::vector<result>& results, E e) {
     double a = 0;
     for (const auto& result : results) {
-        // printf("it tim: %zu\n", result.inner.timed_iters);
-        // printf("it tot: %zu\n", result.inner.total_iters);
-        // phelper("t1", result.inner.ostart_ts, result.inner.oend_ts1);
-        // phelper("t2", result.inner.ostart_ts, result.inner.oend_ts2);
-        // printf("\n");
         a += e(result);
     }
     return a;
@@ -576,7 +645,7 @@ column make_inner(const char* name, result_holder::ir_u64 pmem, const char* form
 
 static column col_core{"Cores", RIGHT, [](Row& r, const result_holder& h){ r.add(h.results.size()); }};
 static column col_desc{"Description", LEFT, [](Row& r, const result_holder& h){ r.add(h.spec.description); }};
-static column col_id  {"ID", LEFT, [](Row& r, const result_holder& h){ r.add(h.spec.id); }};
+static column col_id  {"Implementation", LEFT, [](Row& r, const result_holder& h){ r.add(h.spec.id); }};
 static column col_olap{"Overlap", RIGHT, [](Row& r, const result_holder& h){ r.addf("%.3f", h.get_overlap3()); }};
 static column col_ns  {"Nanos", RIGHT, [](Row& r, const result_holder& h) {
     r.addf("%.1f", aggregate_results(h.results, [](const result& r){ return r.inner.elapsedns_stats.getMedian(); })
@@ -615,7 +684,7 @@ void report_results(const std::vector<result_holder>& results_list) {
         }
     }
 
-    printf("%s", (arg_csv ? table.csv_str() : table.str()).c_str());
+    fmt::print("{}", arg_csv ? table.csv_str() : table.str());
 }
 
 void list_tests() {
@@ -624,7 +693,7 @@ void list_tests() {
     for (auto& t : ALL_FUNCS) {
         table.newRow().add(t.id).add(t.description);
     }
-    printf("Available tests:\n\n%s\n", table.str().c_str());
+    fmt::print("Available tests:\n\n{}\n", table.str().c_str());
 }
 
 std::vector<int> get_cpus() {
@@ -644,21 +713,22 @@ std::vector<int> get_cpus() {
 
 int main(int argc, char** argv) {
 
-    try {
-        parser.ParseCLI(argc, argv);
-    } catch (args::Help& help) {
-        printf("%s\n", parser.Help().c_str());
-        exit(EXIT_SUCCESS);
-    } catch (const args::ParseError& e) {
-        printf("ERROR while parsing arguments: %s\n", e.what());
-        printf("\nUsage:\n%s\n", parser.Help().c_str());
-        exit(EXIT_FAILURE);
-    }
+    parser.ParseCLI(argc, argv,
+            [](const std::string& help) {
+                fmt::print("{}\n", help);
+                exit(EXIT_SUCCESS);
+            }, [](const std::string& parse_error) {
+                fmt::print(stderr, "ERROR while parsing arguments: {}\n", parse_error);
+                fmt::print(stderr, "\nUsage:\n{}\n", parser.Help());
+                exit(EXIT_FAILURE);
+            });
 
     // if csv mode is on, only the table should go to stdout
     // the rest goes to stderr
     FILE* out = arg_csv ? stderr : stdout;
+#if USE_RDTSC
     set_logging_file(out);
+#endif
 
     if (arg_list) {
         list_tests();
@@ -669,17 +739,18 @@ int main(int argc, char** argv) {
     bool is_root = (geteuid() == 0);
     auto iters = arg_iters.Get();
     std::vector<int> cpus = get_cpus();
-    
-    fprintf(out, "tsc_freq = %.1f MHz (%s)\n", RdtscClock::tsc_freq() / 1000000.0, get_tsc_cal_info(arg_force_tsc_cal));
-    fprintf(out, "Running as root      : [%s]\n", is_root     ? "YES" : "NO ");
-    fprintf(out, "CPU pinning enabled  : [%s]\n", !arg_no_pin ? "YES" : "NO ");
-    fprintf(out, "available CPUs (%4lu): [%s]\n", cpus.size(), join(cpus, ", ").c_str());
-    fprintf(out, "get_nprocs_conf()    : [%d]\n", get_nprocs_conf());
-    fprintf(out, "get_nprocs()         : [%d]\n", get_nprocs());
-    fprintf(out, "iterations           : [%zu]\n", iters);
+
+#if USE_RDTSC
+    fmt::print(out, "tsc_freq = {:.1f} MHz ({})\n", RdtscClock::tsc_freq() / 1000000.0, get_tsc_cal_info(arg_force_tsc_cal));
+#endif
+    fmt::print(out, "Running as root      : [{}]\n", is_root     ? "YES" : "NO ");
+    fmt::print(out, "CPU pinning enabled  : [{}]\n", !arg_no_pin ? "YES" : "NO ");
+    fmt::print(out, "available CPUs ({:4}): [{}]\n", cpus.size(), join(cpus, ", ").c_str());
+    fmt::print(out, "get_nprocs_conf()    : [{}]\n", get_nprocs_conf());
+    fmt::print(out, "get_nprocs()         : [{}]\n", get_nprocs());
+    fmt::print(out, "iterations           : [{}]\n", iters);
 
     auto max_threads = arg_max_threads ? arg_max_threads.Get() : cpus.size();
-
 
     std::vector<test_func> specs;
     if (arg_algos) {
@@ -689,7 +760,7 @@ int main(int argc, char** argv) {
                 specs.push_back(s);
             }
         }
-    } else { 
+    } else {
         specs.insert(specs.begin(), std::begin(ALL_FUNCS), std::end(ALL_FUNCS));
     }
 

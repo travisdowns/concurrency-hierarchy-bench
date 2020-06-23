@@ -2,15 +2,11 @@
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
-import matplotlib.ticker as plticker
 import pandas as pd
 import numpy as np
-import csv
 import argparse
 import sys
-import collections
 import os
-import json
 
 # for arguments that should be comma-separate lists, we use splitlsit as the type
 splitlist = lambda x: x.split(',')
@@ -55,13 +51,15 @@ p.add_argument('--alpha', help='use the given alpha for marker/line', type=float
 p.add_argument('--linewidth', help='use the given line width', type=float)
 p.add_argument('--tight', help='use tight_layout for less space around chart', action='store_true', default=True)
 
-
 # debugging
 p.add_argument('--verbose', '-v', help='enable verbose logging', action='store_true')
 cargs = p.parse_args()
 
 vprint = print if cargs.verbose else lambda *a: None
 vprint("cargs = ", cargs)
+
+plt.rcParams['axes.labelsize'] = 'large'
+plt.rcParams['axes.titlesize'] = 'large'
 
 # fix various random seeds so we get reproducible plots
 # fix the mpl seed used to generate SVG IDs
@@ -82,6 +80,7 @@ passthru_args  = ['markersize', 'marker', 'color']
 passthru_args2 = ['markersize2', 'marker2', 'color2']
 argsdict = vars(cargs)
 
+
 # populate the per-series arguments, based on the series index
 def populate_args(idx, base, secondary = False):
     assert idx > 0
@@ -98,27 +97,32 @@ def populate_args(idx, base, secondary = False):
             vprint("not set {} for col {}".format(arg, idx))
     return kwargs
 
+
 fullargs = {}
 vprint("kwargs: {}".format(fullargs))
 
 df = pd.read_csv(cargs.input, sep=cargs.sep, index_col=[0, 1])
-vprint("----- from file -------\n", df.head(), "\n---------------------")
 df.sort_index(level=0, inplace=True)
-df = df.unstack().droplevel(axis='columns', level=0)
-# df = df.unstack().droplevel(axis='columns', level=0)
-vprint("----- after sort ------\n", df.head(), "\n---------------------")
-vprint("-----  columns   ------\n", df.columns, "\n---------------------")
+vprint("----- from file -------\n", df.head(), "\n---------------------")
 
-def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overlay=[]):
-    subf = df[cols].copy()
 
-    iv = df.index.values
+def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overlay=[], metrics='Nanos'):
+    subf = df[metrics].copy()
+    vprint("----- after metric slice ------\n", subf.head(), "\n---------------------")
+    subf = subf.unstack()
+    vprint("----- after reshape ------\n", subf.head(), "\n---------------------")
+    subf = subf[cols]
+    vprint("----- after col selection ------\n", subf.head(), "\n---------------------")
+    # subf = subf.unstack().droplevel(axis='columns', level=0)
+    vprint("-----  columns   ------\n", subf.columns, "\n---------------------")
+
+    iv = subf.index.values
     print('iv:', iv)
     subf = subf.loc[(iv >= minthreads) & (iv <= maxthreads), :]
 
     vprint("----- after slice ------\n", subf.head(), "\n---------------------")
 
-    ax = subf.plot.bar(title=title, figsize=(10,6), rot=0, **fullargs)
+    ax = subf.plot.bar(title=title, figsize=(9,6), rot=0, **fullargs)
 
     print('>>>>', ax.containers)
 
@@ -133,16 +137,16 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
                         ha='center', va='bottom', rotation=0, fontsize=16, weight='bold')
                 idx = idx + 1
 
-    if (cargs.xrotate):
+    if cargs.xrotate:
         plt.xticks(rotation=cargs.xrotate)
 
     if cargs.ylabel:
         ax.set_ylabel(cargs.ylabel)
 
     if cargs.ylim:
-        if (len(cargs.ylim) == 1):
+        if len(cargs.ylim) == 1:
             ax.set_ylim(cargs.ylim[0])
-        elif (len(cargs.ylim) == 2):
+        elif len(cargs.ylim) == 2:
             ax.set_ylim(cargs.ylim[0], cargs.ylim[1])
         else:
             sys.exit('provide one or two args to --ylim')
@@ -152,24 +156,24 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
         ax.set_xlabel(cargs.xlabel)
 
     legargs = {}
-    if (cargs.legend_loc):
+    if cargs.legend_loc:
         legargs['loc'] = cargs.legend_loc
 
-    if (cargs.tight):
+    if cargs.tight:
         plt.tight_layout()
 
-    if (cargs.out):
+    if cargs.out:
         outpath = os.path.join(cargs.out, filename + '.svg')
         vprint("Saving figure to ", outpath, "...")
         plt.savefig(outpath)
-    
-    if (not cargs.out or (cargs.show and (cargs.show == 'all' or filename in cargs.show.split(',')))):
+
+    if cargs.show and (cargs.show == 'all' or filename in cargs.show.split(',')):
         vprint("Showing interactive plot...")
         plt.show()
 
     plt.close()
 
-    if (cargs.table_out):
+    if cargs.table_out:
         # this line moves the index name to be the first column name instead
         subf = subf.rename_axis(index=None, columns=subf.index.name)
         header = "---\nlayout: default\n---\n\n"
@@ -178,7 +182,10 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
             f.write(header + subf.to_html())
         vprint('saved html table to', tpath)
 
+
 columns = []
+
+
 def ac(*args):
     columns.extend([*args])
     return columns
@@ -193,3 +200,7 @@ make_plot('ts-4',       'Increment Cost: Ticket Spin', ac('ticket spin'), minthr
 make_plot('ts-6',       'Increment Cost: Ticket Spin (6 threads)', ac(), minthreads=2, maxthreads=(cargs.procs + 2))
 
 make_plot('single',     'Increment Cost: Single Threaded', ac(), maxthreads=1, overlay=[2, 1, 1, 1, 3, 4, 1])
+
+columns = ['atomic add', 'cas multi']
+make_plot('cas-multi', 'Increment Cost: Contention Adaptive Multi-Counter', ac())
+make_plot('tls',       'Increment Cost: Thread Local Storage', ac('tls add'))

@@ -25,3 +25,6 @@ perf.data.*
 
 /results
 /temp
+/local.mk
+
+/compile_commands.json

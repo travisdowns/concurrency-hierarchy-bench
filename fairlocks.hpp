@@ -39,7 +39,7 @@ class ticket_template {
 
 public:
     void lock() {
-        auto ticket = dispenser++;
+        auto ticket = dispenser.fetch_add(1, std::memory_order_relaxed);
 
         while (ticket != serving.load(std::memory_order_acquire))
             SPINF();
@@ -55,7 +55,7 @@ static int nop() {
 }
 
 using ticket_spin   = ticket_template<nop>;
-using yielding_spin = ticket_template<sched_yield>;
+using ticket_yield  = ticket_template<sched_yield>;
 
 class blocking_ticket {
     std::atomic<size_t> dispenser{}, serving{};
