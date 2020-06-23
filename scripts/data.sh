@@ -7,7 +7,7 @@ echo "SLOW_ITERS=${SLOW_ITERS:=10}"
 echo "RDIR=${RDIR:=./results}"
 echo "CPUS=${CPUS:=$(nproc)}"
 
-mkdir -p results
+mkdir -p "$RDIR"
 
 # up to CPU-count threads
 echo "Collecting fast data"
