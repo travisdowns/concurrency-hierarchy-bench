@@ -64,6 +64,10 @@ struct test_func {
     check_f* rac_func;
 };
 
+std::string to_string(const test_func& f) {
+    return f.id;
+}
+
 /**
  * Keeps a counter per thread, readers need to sum
  * the counters from all active threads and add the
@@ -766,9 +770,12 @@ int main(int argc, char** argv) {
         specs.insert(specs.begin(), std::begin(ALL_FUNCS), std::end(ALL_FUNCS));
     }
 
+    auto total_benches = specs.size() * (max_threads - min_threads + 1);
     std::vector<result_holder> results_list;
     for (auto func : specs) {
         for (size_t count = min_threads; count <= max_threads; count++) {
+
+            auto nanos_before = now_nanos();
 
             const bool has_check = func.check_func;
             uint64_t counter_before = has_check ? func.check_func() : 0;
@@ -801,8 +808,8 @@ int main(int argc, char** argv) {
             }
 
             if (arg_progress) {
-                fmt::print(stderr, "Finished {} of {} benchmarks\n", results_list.size(), specs.size() *
-                        (max_threads - min_threads + 1));
+                fmt::print(stderr, "{}/{}: finished {} with {} threads in {} ms\n",  results_list.size(),
+                           total_benches, to_string(func), count, (now_nanos() - nanos_before) / 1000000);
             }
         }
     }
