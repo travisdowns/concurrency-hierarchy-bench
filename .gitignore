@@ -23,7 +23,6 @@ __pycache__
 perf.data
 perf.data.*
 
-/results
 /temp
 /local.mk
 
