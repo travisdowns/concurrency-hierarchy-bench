@@ -6,7 +6,6 @@
 #include <error.h>
 #include <sched.h>
 #include <sys/sysinfo.h>
-#include <sys/types.h>
 #include <unistd.h>
 
 #include <array>
@@ -18,13 +17,14 @@
 #include <deque>
 #include <exception>
 #include <functional>
-#include <limits>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <thread>
 #include <vector>
 
 #include "args-wrap.hpp"
+#include "cyclic-barrier.hpp"
 #include "fairlocks.hpp"
 #include "fmt/format.h"
 #include "hedley.h"
@@ -326,7 +326,6 @@ static argsw::Flag arg_force_tsc_cal{parser, "force-tsc-calibrate",
 static argsw::Flag arg_no_pin{parser, "no-pin",
     "Don't try to pin threads to CPU - gives worse results but works around affinity issues on TravisCI", {"no-pin"}};
 static argsw::Flag arg_verbose{parser, "verbose", "Output more info", {"verbose"}};
-static argsw::Flag arg_nobarrier{parser, "no-barrier", "Don't sync up threads before each test (debugging only)", {"no-barrier"}};
 static argsw::Flag arg_list{parser, "list", "List the available tests and their descriptions", {"list"}};
 static argsw::Flag arg_csv{parser, "", "Output a csv table instead of the default", {"csv"}};
 static argsw::Flag arg_progress{parser, "", "Display progress to stdout", {"progress"}};
@@ -334,11 +333,11 @@ static argsw::Flag arg_progress{parser, "", "Display progress to stdout", {"prog
 static argsw::Flag arg_hyperthreads{parser, "allow-hyperthreads", "By default we try to filter down the available cpus to include only physical cores, but "
     "with this option we'll use all logical cores meaning you'll run two tests on cores with hyperthreading", {"allow-hyperthreads"}};
 static argsw::ValueFlag<std::string> arg_algos{parser, "TEST-ID", "Run only the algorithms in the comma separated list", {"algos"}};
-static argsw::ValueFlag<size_t> arg_iters{parser, "ITERS", "Run the test loop ITERS times (default 100000)", {"iters"}, 10};
-static argsw::ValueFlag<int> arg_min_threads{parser, "MIN", "The minimum number of threads to use", {"min-threads"}, 1};
-static argsw::ValueFlag<int> arg_max_threads{parser, "MAX", "The maximum number of threads to use", {"max-threads"}};
-static argsw::ValueFlag<uint64_t> arg_warm_ms{parser, "MILLISECONDS", "Warmup milliseconds for each thread after pinning (default 100)", {"warmup-ms"}, 100};
-
+static argsw::ValueFlag<size_t> arg_batch{parser, "BATCH-SIZE", "Make BATCH-SIZE calls to the function under test in between checks for test termination", {"batch"}, 1000};
+static argsw::ValueFlag<uint64_t> arg_trial_time{parser, "TIME-MS", "The time for each trial in ms", {"trial-time"}, 10};
+static argsw::ValueFlag<uint32_t> arg_min_threads{parser, "MIN", "The minimum number of threads to use", {"min-threads"}, 1};
+static argsw::ValueFlag<uint32_t> arg_max_threads{parser, "MAX", "The maximum number of threads to use", {"max-threads"}};
+static argsw::ValueFlag<uint64_t> arg_warm_ms{parser, "MILLISECONDS", "Warmup milliseconds for each thread after pinning (default 100)", {"warmup-ms"}, 10};
 
 bool verbose;
 
@@ -405,96 +404,10 @@ static uint64_t now_nanos() {
     return CLOCK::now_to_nanos(CLOCK::now());
 }
 
-/*
- * The result of the run_test method, with only the stuff
- * that can be calculated from within that method.
- */
-struct inner_result {
-    DescriptiveStats elapsedns_stats;
-    uint64_t ostart_ts; // start of the benchmark
-    uint64_t oend_ts1; // end of the timed portion of the benchmark (not including spinning iters
-    uint64_t oend_ts2; // includes spinning iters waiting for other tests to finish
-    uint64_t istart_ts, iend_ts; // start and end timestamps for the "critical" benchmark portion
-    uint64_t timed_iters = 0; // the number of iterationreac the ctimed part of the test
-    uint64_t total_iters = 0;
-    uint64_t reacquires  = 0; // number of times the counter was incremement consecutively by this thread
+struct timer_barrier : public cyclic_barrier_template<uint64_t> {
+    timer_barrier(uint32_t break_count, uint64_t offset_nanos) :
+          cyclic_barrier_template<uint64_t>{break_count, [=](){ return now_nanos() + offset_nanos; }} {}
 };
-
-/*
- * Calculate the frequency of the CPU based on timing a tight loop that we expect to
- * take one iteration per cycle.
- *
- * ITERS is the base number of iterations to use: the calibration routine is actually
- * run twice, once with ITERS iterations and once with 2*ITERS, and a delta is used to
- * remove measurement overhead.
- */
-struct hot_barrier {
-    size_t break_count;
-    std::atomic<size_t> current;
-    hot_barrier(size_t count) : break_count(count), current{0} {}
-
-    /* increment the arrived count of the barrier (do this once per thread generally) */
-    void increment() {
-        current++;
-    }
-
-    /* return true if all the threads have arrived, never blocks */
-    bool is_broken() {
-        return current.load() == break_count;
-    }
-
-    /* increment and hot spin on the waiter count until it hits the break point, returns the spin count in case you care */
-    long wait() {
-        increment();
-        long count = 0;
-        while (!is_broken()) {
-            count++;
-        }
-        return count;
-    }
-};
-
-
-template <typename CLOCK, size_t TRIES = 17, size_t WARMUP = 2>
-inner_result run_test(cal_f* func, size_t iters, hot_barrier *barrier) {
-
-    std::array<typename CLOCK::delta_t, TRIES> results;
-
-    inner_result result;
-
-    result.ostart_ts = now_nanos();
-    for (size_t w = 0; w < WARMUP + 1; w++) {
-        uint64_t reacquires = 0;
-        result.istart_ts = now_nanos();
-        for (size_t r = 0; r < TRIES; r++) {
-            auto t0 = CLOCK::now();
-            reacquires += func(iters);
-            auto t1 = CLOCK::now();
-            results[r] = t1 - t0;
-        }
-        result.iend_ts = now_nanos();
-        result.reacquires = reacquires;
-    }
-
-    result.oend_ts1 = now_nanos();
-
-    // this loop keeps running the test function until all other
-    // threads are done too, to keep the environment consistent
-    for (barrier->increment(); !barrier->is_broken();) {
-        func(iters);
-        result.total_iters += iters;
-    }
-    result.oend_ts2 = now_nanos();
-
-    result.timed_iters = TRIES * iters;
-    result.total_iters += (WARMUP + 1) * TRIES * iters;
-
-    std::array<uint64_t, TRIES> nanos = {};
-    std::transform(results.begin(), results.end(), nanos.begin(), CLOCK::to_nanos);
-    result.elapsedns_stats = get_stats(nanos.begin(), nanos.end());
-
-    return result;
-}
 
 struct usage_error : public std::runtime_error {
     using runtime_error::runtime_error;
@@ -512,30 +425,34 @@ test_func find_one_test(const std::string& id) {
 
 
 struct result {
-    static constexpr double nan = std::numeric_limits<double>::quiet_NaN();
-    inner_result    inner;
+    uint64_t    start_ts;   // start timestamp
+    uint64_t      end_ts;   // end   timestamp
+    uint64_t delta_nanos; // end - start
+    uint64_t total_iters = 0;
 
-    uint64_t  start_ts;  // start timestamp
-    uint64_t    end_ts;  // end   timestamp
+    uint64_t reacquires  = 0; // number of times the counter was incremement consecutively by this thread
 };
 
 struct result_holder {
     test_func spec;
     size_t iters;
+    size_t trial;
+    uint64_t nanos; // total runtime for all trials
     std::vector<result> results; // will have spec.count() elements
 
-    result_holder(test_func spec, size_t iters) : spec{std::move(spec)}, iters{iters} {}
+    result_holder(test_func spec, size_t iters, size_t trial, uint64_t nanos)
+        : spec{std::move(spec)}, iters{iters}, trial{trial}, nanos{nanos} {}
 
     template <typename E>
     double inner_sum(E e) const {
         double a = 0;
         for (const auto& result : results) {
-            a += e(result.inner);
+            a += e(result);
         }
         return a;
     }
 
-    typedef uint64_t (inner_result::*ir_u64);
+    typedef uint64_t (result::*ir_u64);
 
     double inner_sum(result_holder::ir_u64 pmem) const {
         return inner_sum(std::mem_fn(pmem));
@@ -545,19 +462,6 @@ struct result_holder {
     double get_overlap1() const {
         std::vector<std::pair<uint64_t, uint64_t>> ranges = transformv(results, [](const result& r){ return std::make_pair(r.start_ts, r.end_ts);} );
         return conc_ratio(ranges.begin(), ranges.end());
-    }
-
-    /** calculate the overlap ratio based on the start/end timestamps */
-    double get_overlap2() const {
-        std::vector<std::pair<uint64_t, uint64_t>> ranges = transformv(results, [](const result& r){ return std::make_pair(r.inner.istart_ts, r.inner.iend_ts);} );
-        return conc_ratio(ranges.begin(), ranges.end());
-    }
-
-    /** calculate the inner overlap ratio based on the start/end timestamps */
-    double get_overlap3() const {
-        auto orange = transformv(results, [](const result& r){ return std::make_pair(r.inner.ostart_ts, r.inner.oend_ts2);} );
-        auto irange = transformv(results, [](const result& r){ return std::make_pair(r.inner.istart_ts, r.inner.iend_ts);} );
-        return nconc_ratio(orange.begin(), orange.end(), irange.begin(), irange.end());
     }
 };
 
@@ -575,24 +479,29 @@ struct warmup {
     }
 };
 
+constexpr int WARMUP = 3;
+constexpr int TRIALS = 15;
+
 struct test_thread {
     size_t id;
     int cpu; // pin to this cpu id
-    hot_barrier* start_barrier;
-    hot_barrier* stop_barrier;
+    timer_barrier* start_barrier;
 
-    /* output */
-    result res;
+    // results, one per trial
+    std::vector<result> results;
+    size_t total_iters = 0; // total iterations across all trials and warmups
 
     /* input */
-    test_func test;
+    test_func func;
     size_t iters;
+    uint64_t trial_nanos;
 
     std::thread thread;
 
-    test_thread(size_t id, int cpu, hot_barrier& start_barrier, hot_barrier& stop_barrier, const test_func& test, size_t iters) :
-        id{id}, cpu{cpu}, start_barrier{&start_barrier}, stop_barrier{&stop_barrier}, test{test},
-        iters{iters}, thread{std::ref(*this)}
+    test_thread(size_t id, int cpu, timer_barrier& start_barrier, const test_func& func, size_t iters,
+                uint64_t trial_nanos) :
+        id{id}, cpu{cpu}, start_barrier{&start_barrier}, func{func},
+        iters{iters}, trial_nanos{trial_nanos}, thread{std::ref(*this)}
     {
         if (verbose) fmt::print("Constructed test in thread {}, this = {}\n", id, (void *)this);
     }
@@ -602,19 +511,42 @@ struct test_thread {
     void operator=(const test_thread&) = delete;
 
     void operator()() {
+        using CLOCK = DefaultClock;
         if (cpu >= 0) {
             pin_to_cpu(cpu);
         }
         warmup w{arg_warm_ms.Get()};
         long warms = w.warm();
         if (verbose) fmt::print("{:2} Warmup iters {}\n", id, warms);
-        if (!arg_nobarrier) {
-            long count = start_barrier->wait();
-            if (verbose) fmt::print("{:2} Thread loop count: {}\n", id, count);
+
+        results.resize(TRIALS);
+
+        for (int trial = -WARMUP; trial < TRIALS; trial++) {
+            auto deadline = start_barrier->wait();
+            if (verbose) fmt::print("{:2} Thread deadline: {}\n", id, deadline);
+
+            result result{};
+            result.start_ts = now_nanos();
+
+            auto f = func.func;
+            CLOCK::delta_t delta;
+
+            uint64_t reacquires = 0;
+            auto t0             = CLOCK::now();
+            do {
+                reacquires += f(iters);
+                result.total_iters += iters;
+            } while (now_nanos() < deadline);
+            auto t1             = CLOCK::now();
+            result.start_ts = CLOCK::now_to_nanos(t0);
+            result.end_ts = CLOCK::now_to_nanos(t1);
+            result.delta_nanos  = CLOCK::to_nanos(t1 - t0);
+            result.reacquires  = reacquires;
+
+            // this indexing eliminates the warmup runs from the results
+            results.at(trial < 0 ? 0 : trial) = result;
+            total_iters += result.total_iters;
         }
-        res.start_ts = now_nanos();
-        res.inner = run_test<DefaultClock>(test.func, iters, stop_barrier);
-        res.end_ts = now_nanos();
     }
 };
 
@@ -625,6 +557,14 @@ double aggregate_results(const std::vector<result>& results, E e) {
         a += e(result);
     }
     return a;
+}
+
+/**
+ * Aggregate normalized results sum(N(ri)) / sum(M(ri)).
+ */
+template <typename N, typename M>
+double aggregate_results(const std::vector<result>& results, N top, M bottom) {
+    return aggregate_results(results, top) / aggregate_results(results, bottom);
 }
 
 using Row = table::Row;
@@ -638,38 +578,44 @@ struct column {
     extractor e;
 };
 
-column make_inner(const char* name, result_holder::ir_u64 pmem, const char* format = "%.1f") {
+column make_inner(const char* name, result_holder::ir_u64 pmem, const char* format = "%.1f", double mult = 1.0) {
     return column{name, RIGHT,
             [=](Row& r, const result_holder& h) {
-                r.addf(format, h.inner_sum(pmem));
+                r.addf(format, h.inner_sum(pmem) * mult);
             }
     };
 }
 
+static column col_core{"Cores", RIGHT, [](Row& r, const result_holder& h) { r.add(h.results.size()); }};
+static column col_trial{"Trial", RIGHT, [](Row& r, const result_holder& h) { r.add(h.trial); }};
+static column col_desc{"Description", LEFT, [](Row& r, const result_holder& h) { r.add(h.spec.description); }};
+static column col_id{"Implementation", LEFT, [](Row& r, const result_holder& h) { r.add(h.spec.id); }};
+static column col_olap{"Overlap", RIGHT, [](Row& r, const result_holder& h) { r.addf("%.3f", h.get_overlap1()); }};
+static column col_ns{"Nanos/Op", RIGHT, [](Row& r, const result_holder& h) {
+                         r.addf("%.1f", aggregate_results(
+                                                h.results, [](const result& r) { return r.delta_nanos; },
+                                                [](const result& r) { return r.total_iters; }));
+                     }};
+static column col_cs{"Clock sum ms", RIGHT, [](Row& r, const result_holder& h) {
+                         r.addf("%.1f", aggregate_results(h.results, [](const result& r) { return r.delta_nanos / 1000000.; }));
+                     }};
 
-
-static column col_core{"Cores", RIGHT, [](Row& r, const result_holder& h){ r.add(h.results.size()); }};
-static column col_desc{"Description", LEFT, [](Row& r, const result_holder& h){ r.add(h.spec.description); }};
-static column col_id  {"Implementation", LEFT, [](Row& r, const result_holder& h){ r.add(h.spec.id); }};
-static column col_olap{"Overlap", RIGHT, [](Row& r, const result_holder& h){ r.addf("%.3f", h.get_overlap3()); }};
-static column col_ns  {"Nanos", RIGHT, [](Row& r, const result_holder& h) {
-    r.addf("%.1f", aggregate_results(h.results, [](const result& r){ return r.inner.elapsedns_stats.getMedian(); })
-                / (h.iters * h.results.size())); }};
-
-static column col_iter  = make_inner("Iters", &inner_result::timed_iters, "%.0f");
-static column col_titer = make_inner("Total", &inner_result::total_iters, "%.0f");
-static column col_reac  = make_inner("Reac" , &inner_result::reacquires);
+static column col_rt{"Runtime ms", RIGHT, [](Row& r, const result_holder& h) { r.addf("%.0f", h.nanos / 1000000.); }};
+static column col_iter = make_inner("Total", &result::total_iters, "%.0f");
+static column col_reac  = make_inner("Reac" , &result::reacquires);
 static column col_runs{"Rlen", RIGHT, [](Row& r, const result_holder& h) {
-    auto reac  = h.inner_sum(&inner_result::reacquires);
-    auto total = h.inner_sum(&inner_result::timed_iters);
+    auto reac  = h.inner_sum(&result::reacquires);
+    auto total = h.inner_sum(&result::total_iters);
     r.addf("%.1f", (double)total / (1 + total - reac));
 }};
 
 void report_results(const std::vector<result_holder>& results_list) {
 
     auto cols = arg_csv ?
-        std::vector<column>{col_core, col_id, col_ns, col_titer, col_runs} :
-        std::vector<column>{col_core, col_id, col_olap, col_ns, col_iter, col_titer, col_reac, col_runs};
+        std::vector<column>{col_trial, col_core, col_id, col_ns, col_iter, col_runs} :
+        std::vector<column>{col_trial, col_core, col_id, col_olap, col_ns, col_cs, col_rt, col_iter
+//                                            , col_reac, col_runs
+        };
 
     // report
     table::Table table;
@@ -742,7 +688,8 @@ int main(int argc, char** argv) {
 
     verbose = arg_verbose;
     bool is_root = (geteuid() == 0);
-    auto iters = arg_iters.Get();
+    auto batch_size = arg_batch.Get();
+    auto trial_time = arg_trial_time.Get();
     std::vector<int> cpus = get_cpus();
 
 #if USE_RDTSC
@@ -753,10 +700,11 @@ int main(int argc, char** argv) {
     fmt::print(out, "available CPUs ({:4}): [{}]\n", cpus.size(), join(cpus, ", ").c_str());
     fmt::print(out, "get_nprocs_conf()    : [{}]\n", get_nprocs_conf());
     fmt::print(out, "get_nprocs()         : [{}]\n", get_nprocs());
-    fmt::print(out, "iterations           : [{}]\n", iters);
+    fmt::print(out, "batch count          : [{}]\n", batch_size);
+    fmt::print(out, "trial time           : [{} ms]\n", trial_time);
 
     auto min_threads = arg_min_threads.Get();
-    auto max_threads = arg_max_threads ? arg_max_threads.Get() : cpus.size();
+    auto max_threads = arg_max_threads ? arg_max_threads.Get() : (uint32_t)cpus.size();
 
     std::vector<test_func> specs;
     if (arg_algos) {
@@ -773,7 +721,7 @@ int main(int argc, char** argv) {
     auto total_benches = specs.size() * (max_threads - min_threads + 1);
     std::vector<result_holder> results_list;
     for (auto func : specs) {
-        for (size_t count = min_threads; count <= max_threads; count++) {
+        for (auto count = min_threads; count <= max_threads; count++) {
 
             auto nanos_before = now_nanos();
 
@@ -781,23 +729,26 @@ int main(int argc, char** argv) {
             uint64_t counter_before = has_check ? func.check_func() : 0;
 
             // run
-            hot_barrier start{count}, stop{count};
+            timer_barrier start{count, trial_time * 1000000};
             std::deque<test_thread> threads;
             for (size_t tid = 0; tid < count; tid++) {
                 int cpu = arg_no_pin ? -1 : cpus.at(tid % cpus.size());
                 if (verbose) fmt::print("thread {} pinned to {}\n", tid, cpu);
-                threads.emplace_back(tid, cpu, start, stop, func, iters);
+                threads.emplace_back(tid, cpu, start, func, batch_size, trial_time * 1000000);
             }
 
-            for (auto& t : threads) {
-                t.thread.join();
-            }
-
-            results_list.emplace_back(func, iters);
             uint64_t total_iters = 0;
             for (auto& t : threads) {
-                results_list.back().results.push_back(t.res);
-                total_iters += t.res.inner.total_iters;
+                t.thread.join();
+                total_iters += t.total_iters;
+            }
+
+            for (size_t trial = 0; trial < TRIALS; trial++) {
+                results_list.emplace_back(func, batch_size, trial, now_nanos() - nanos_before);
+                for (auto& t : threads) {
+                    auto& r = t.results.at(trial);
+                    results_list.back().results.push_back(r);
+                }
             }
 
             auto counter_after = has_check ? func.check_func() : 0;
@@ -808,7 +759,7 @@ int main(int argc, char** argv) {
             }
 
             if (arg_progress) {
-                fmt::print(stderr, "{}/{}: finished {} with {} threads in {} ms\n",  results_list.size(),
+                fmt::print(stderr, "{}/{}: finished {} with {} threads in {} ms\n",  results_list.size() / TRIALS,
                            total_benches, to_string(func), count, (now_nanos() - nanos_before) / 1000000);
             }
         }

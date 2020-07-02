@@ -101,12 +101,12 @@ def populate_args(idx, base, secondary = False):
 fullargs = {}
 vprint("kwargs: {}".format(fullargs))
 
-df = pd.read_csv(cargs.input, sep=cargs.sep, index_col=[0, 1])
+df = pd.read_csv(cargs.input, sep=cargs.sep, index_col=[0, 1, 2])
 df.sort_index(level=0, inplace=True)
 vprint("----- from file -------\n", df.head(), "\n---------------------")
 
 
-def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overlay=[], metrics='Nanos'):
+def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overlay=[], metrics='Nanos/Op'):
     subf = df[metrics].copy()
     vprint("----- after metric slice ------\n", subf.head(), "\n---------------------")
     subf = subf.unstack()
@@ -116,26 +116,53 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
     # subf = subf.unstack().droplevel(axis='columns', level=0)
     vprint("-----  columns   ------\n", subf.columns, "\n---------------------")
 
-    iv = subf.index.values
+    iv = subf.index.get_level_values('Cores')
     print('iv:', iv)
     subf = subf.loc[(iv >= minthreads) & (iv <= maxthreads), :]
+    vprint("----- after core filter ------\n", subf.head(), "\n---------------------")
 
-    vprint("----- after slice ------\n", subf.head(), "\n---------------------")
+    gb = subf.groupby(by=['Cores']);
+    median = gb.median()
+    vprint("----- after groupby ------\n", median.head(n=20), "\n---------------------")
 
-    ax = subf.plot.bar(title=title, figsize=(9,6), rot=0, **fullargs)
+    p10 = median - gb.quantile(0.10)
+    p90 = gb.quantile(0.90) - median
+    vprint("----- p10 ------\n", p10.head(), "\n---------------------")
+    vprint("----- p90 ------\n", p90.head(), "\n---------------------")
 
-    print('>>>>', ax.containers)
+
+    p10v = p10[cols[0]].values;
+    vprint('p10v: ', p10v)
+    vprint('p10v shape:', np.shape(p10v))
+
+    # https://stackoverflow.com/a/37139647
+    # y error specification should have shape
+    # ( number of columns, 2, number of rows )
+    # or equivalently
+    # ( number of bars within a group, 2, number of groups )
+    err = []
+    for col in median:
+        err.append([p10[col].values, p90[col].values])
+    # vprint('err:', err)
+    vprint('err shape:', np.shape(err))
+
+    ax = median.plot.bar(title=title, figsize=(9,6), rot=0, yerr=err, **fullargs)
+
+    vprint('>>>>', ax.containers)
 
     # # add overlay to the bars
     if overlay:
         idx = 0
         for bars in ax.containers:
-            for rect in bars:
-                height = rect.get_height()
-                ax.text(rect.get_x() + rect.get_width()/2., height/2,
-                        overlay[idx],
-                        ha='center', va='bottom', rotation=0, fontsize=16, weight='bold')
-                idx = idx + 1
+            print('bars: ', bars)
+            print('type: ', type(bars))
+            if isinstance(bars, mpl.container.BarContainer):
+                for rect in bars:
+                    height = rect.get_height()
+                    ax.text(rect.get_x() + rect.get_width()/2., height/2,
+                            overlay[idx],
+                            ha='center', va='bottom', rotation=0, fontsize=16, weight='bold')
+                    idx = idx + 1
 
     if cargs.xrotate:
         plt.xticks(rotation=cargs.xrotate)
@@ -191,7 +218,7 @@ def ac(*args):
     return columns
 
 
-make_plot('mutex',      'Increment Cost: std::mutex and spinlock', ac('mutex add'), minthreads=2)
+make_plot('mutex',      'Increment Cost: std::mutex', ac('mutex add'), minthreads=2)
 make_plot('atomic-inc', 'Increment Cost: Atomic Increments', ac('atomic add', 'cas add'), minthreads=2)
 make_plot('atomic-inc1','Increment Cost: Atomic Increments', ac(), maxthreads=1)
 make_plot('fair-yield', 'Increment Cost: Yielding Ticket', ac('ticket yield'), minthreads=2)

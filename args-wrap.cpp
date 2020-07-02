@@ -75,6 +75,7 @@ Base::operator bool() const noexcept
 
 #define VF_TYPES_X(fn) \
     fn(int) \
+    fn(unsigned) \
     fn(size_t) \
     fn(double) \
     fn(std::string)
