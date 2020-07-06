@@ -13,7 +13,7 @@ splitlist = lambda x: x.split(',')
 
 p = argparse.ArgumentParser(usage='plot output from ./bench')
 
-p.add_argument('--procs', help='Number of processors used (CPUS in data.sh)', default=4)
+p.add_argument('--procs', help='Number of processors used (CPUS in data.sh)', default=4, type=int)
 
 # input and output file configuration
 p.add_argument('input', help='CSV file to plot (or stdin)', type=argparse.FileType('r'), default=[ sys.stdin ])
@@ -117,7 +117,7 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
     vprint("-----  columns   ------\n", subf.columns, "\n---------------------")
 
     iv = subf.index.get_level_values('Cores')
-    print('iv:', iv)
+    vprint('iv:', iv)
     subf = subf.loc[(iv >= minthreads) & (iv <= maxthreads), :]
     vprint("----- after core filter ------\n", subf.head(), "\n---------------------")
 
@@ -154,8 +154,8 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
     if overlay:
         idx = 0
         for bars in ax.containers:
-            print('bars: ', bars)
-            print('type: ', type(bars))
+            # print('bars: ', bars)
+            # print('type: ', type(bars))
             if isinstance(bars, mpl.container.BarContainer):
                 for rect in bars:
                     height = rect.get_height()
@@ -202,7 +202,7 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
 
     if cargs.table_out:
         # this line moves the index name to be the first column name instead
-        subf = subf.rename_axis(index=None, columns=subf.index.name)
+        # subf = subf.rename_axis(index=None, columns=subf.index.name)
         header = "---\nlayout: default\n---\n\n"
         tpath = os.path.join(cargs.table_out, filename + '.html')
         with open(tpath, 'w') as f:
@@ -211,7 +211,6 @@ def make_plot(filename, title, cols, minthreads=1, maxthreads=cargs.procs, overl
 
 
 columns = []
-
 
 def ac(*args):
     columns.extend([*args])
@@ -224,7 +223,7 @@ make_plot('atomic-inc1','Increment Cost: Atomic Increments', ac(), maxthreads=1)
 make_plot('fair-yield', 'Increment Cost: Yielding Ticket', ac('ticket yield'), minthreads=2)
 make_plot('more-fair',  'Increment Cost: More Fair Locks', ac('ticket blocking', 'queued fifo'), minthreads=2)
 make_plot('ts-4',       'Increment Cost: Ticket Spin', ac('ticket spin'), minthreads=2)
-make_plot('ts-6',       'Increment Cost: Ticket Spin (6 threads)', ac(), minthreads=2, maxthreads=(cargs.procs + 2))
+make_plot('ts-6',       'Increment Cost: Ticket Spin (Oversubscribed)', ac(), minthreads=2, maxthreads=(cargs.procs + 2))
 
 make_plot('single',     'Increment Cost: Single Threaded', ac(), maxthreads=1, overlay=[2, 1, 1, 1, 3, 4, 1])
 
