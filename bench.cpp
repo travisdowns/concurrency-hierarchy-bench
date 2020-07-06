@@ -61,7 +61,6 @@ struct test_func {
     const char* id;
     const char* description;
     check_f* check_func;
-    check_f* rac_func;
 };
 
 std::string to_string(const test_func& f) {
@@ -158,6 +157,19 @@ class atomic_add_counter {
 public:
     uint64_t operator++(int) {
         return counter.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    uint64_t read() const {
+        return counter.load(std::memory_order_relaxed);
+    }
+};
+
+template <typename std::memory_order O>
+class add_template {
+    std::atomic<uint64_t> counter{};
+public:
+    uint64_t operator++(int) {
+        return counter.fetch_add(1, O);
     }
 
     uint64_t read() const {
@@ -292,6 +304,15 @@ test_func make_from_type(const char *name) {
     return { [](size_t i) { return bench_template(*O, i); } , name , "desc" , []{ return O->read(); } };
 }
 
+template <typename T>
+test_func make_unchecked(const char *name) {
+    static T counter;
+    return { [](size_t i) {
+        return bench_template(counter, i);
+    }
+    , name , "desc" , nullptr };
+}
+
 std::vector<test_func> ALL_FUNCS = {
         {plain_add                                      , "plain add"  , "desc" , nullptr }                             ,
         {tls_add                                        , "tls add"    , "desc" , tls_counter::read }                   ,
@@ -303,10 +324,16 @@ std::vector<test_func> ALL_FUNCS = {
         make_from_lock<locks::spinlock_pause>("pause spin")       ,
         make_from_lock<locks::spinlock_yield>("yield spin")       ,
         make_from_lock<locks::ticket_spin>("ticket spin")         ,
-        make_from_lock<locks::ticket_yield>("ticket yield")      ,
+        make_from_lock<locks::ticket_yield>("ticket yield")       ,
         make_from_lock<locks::blocking_ticket>("ticket blocking") ,
         make_from_lock<locks::fifo_queued>("queued fifo")         ,
         make_from_lock<locks::mutex3>("mutex3")                   ,
+        make_unchecked<atomic_add_counter>("aadd-1"),
+        make_unchecked<add_template<std::memory_order_relaxed>>("aadd-relaxed"),
+        make_unchecked<add_template<std::memory_order_acquire>>("aadd-acquire"),
+        make_unchecked<add_template<std::memory_order_release>>("aadd-release"),
+        make_unchecked<add_template<std::memory_order_acq_rel>>("aadd-acq_rel"),
+        make_unchecked<add_template<std::memory_order_seq_cst>>("aadd-seq_cst"),
 };
 
 static void pin_to_cpu(int cpu) {
