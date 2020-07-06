@@ -76,12 +76,12 @@ std::string to_string(const test_func& f) {
 class tls_counter {
     std::atomic<uint64_t> counter{0};
 
-    /* protects all_counters */
+    /* protects all_counters and accumulator */
     static std::mutex lock;
     /* list of all active counters */
     static std::vector<tls_counter *> all_counters;
     /* accumulated value of counters from dead threads */
-    static std::atomic<uint64_t> accumulator;
+    static uint64_t accumulator;
     /* per-thread tls_counter object */
     static thread_local tls_counter tls;
 
@@ -127,7 +127,7 @@ public:
 
 std::mutex tls_counter::lock;
 std::vector<tls_counter *> tls_counter::all_counters;
-std::atomic<uint64_t> tls_counter::accumulator;
+uint64_t tls_counter::accumulator;
 thread_local tls_counter tls_counter::tls;
 
 HEDLEY_NEVER_INLINE
