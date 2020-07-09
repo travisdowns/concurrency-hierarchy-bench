@@ -47,7 +47,9 @@ using namespace Stats;
 using cal_f = uint64_t(uint64_t iters);
 using check_f = uint64_t();
 
+#ifndef CHECK_RAC
 #define CHECK_RAC 0
+#endif
 
 #if CHECK_RAC
 #define IF_RAC(...) __VA_ARGS__
@@ -253,6 +255,7 @@ cas_multi_counter cas_mc;
  * @return the rac count: the number of times increments were consecutive
  */
 template <typename T>
+HEDLEY_NEVER_INLINE
 uint64_t bench_template(T& counter, size_t iters) {
     uint64_t rac_count = 0;
     IF_RAC(uint64_t last = counter.read() - 1;)
@@ -456,7 +459,6 @@ struct result {
     uint64_t      end_ts;   // end   timestamp
     uint64_t delta_nanos; // end - start
     uint64_t total_iters = 0;
-
     uint64_t reacquires  = 0; // number of times the counter was incremement consecutively by this thread
 };
 
@@ -469,6 +471,15 @@ struct result_holder {
 
     result_holder(test_func spec, size_t iters, size_t trial, uint64_t nanos)
         : spec{std::move(spec)}, iters{iters}, trial{trial}, nanos{nanos} {}
+
+    template <typename InitT, typename BinOp>
+    double inner_accum(InitT init, BinOp op) const {
+        InitT sum = init;
+        for (const auto& result : results) {
+            sum = op(sum, result);
+        }
+        return static_cast<double>(sum);
+    }
 
     template <typename E>
     double inner_sum(E e) const {
@@ -613,6 +624,14 @@ column make_inner(const char* name, result_holder::ir_u64 pmem, const char* form
     };
 }
 
+template <typename F>
+column make_inner2(const char* name, uint64_t init, F f, const char* format = "%.1f") {
+    return column{name, RIGHT, [=](Row& r, const result_holder& h) {
+                      auto res = h.inner_accum<uint64_t>(init, f);
+                      r.addf(format, res);
+                  }};
+}
+
 static column col_core{"Cores", RIGHT, [](Row& r, const result_holder& h) { r.add(h.results.size()); }};
 static column col_trial{"Trial", RIGHT, [](Row& r, const result_holder& h) { r.add(h.trial); }};
 static column col_desc{"Description", LEFT, [](Row& r, const result_holder& h) { r.add(h.spec.description); }};
@@ -628,8 +647,12 @@ static column col_cs{"Clock sum ms", RIGHT, [](Row& r, const result_holder& h) {
                      }};
 
 static column col_rt{"Runtime ms", RIGHT, [](Row& r, const result_holder& h) { r.addf("%.0f", h.nanos / 1000000.); }};
-static column col_iter = make_inner("Total", &result::total_iters, "%.0f");
-static column col_reac  = make_inner("Reac" , &result::reacquires);
+static column col_iter = make_inner("Total I", &result::total_iters, "%.0f");
+static column col_reac = make_inner("Reac" , &result::reacquires);
+static column col_mini = make_inner2("Min I", std::numeric_limits<uint64_t>::max(),
+        [](uint64_t min, const result& r) { return std::min(min, r.total_iters); });
+static column col_maxi = make_inner2("Max I", std::numeric_limits<uint64_t>::min(),
+        [](uint64_t max, const result& r) { return std::max(max, r.total_iters); });
 static column col_runs{"Rlen", RIGHT, [](Row& r, const result_holder& h) {
     auto reac  = h.inner_sum(&result::reacquires);
     auto total = h.inner_sum(&result::total_iters);
@@ -640,8 +663,9 @@ void report_results(const std::vector<result_holder>& results_list) {
 
     auto cols = arg_csv ?
         std::vector<column>{col_trial, col_core, col_id, col_ns, col_iter, col_runs} :
-        std::vector<column>{col_trial, col_core, col_id, col_olap, col_ns, col_cs, col_rt, col_iter
-//                                            , col_reac, col_runs
+        std::vector<column>{col_trial, col_core, col_id, col_olap, col_ns, col_cs, col_rt, col_iter,
+        col_mini, col_maxi
+        IF_RAC(, col_reac, col_runs)
         };
 
     // report
