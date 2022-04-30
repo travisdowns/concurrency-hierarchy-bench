@@ -44,7 +44,7 @@ using namespace std::chrono;
 
 using namespace Stats;
 
-using cal_f = uint64_t(uint64_t iters);
+using cal_f = uint64_t(size_t iters, size_t id);
 using check_f = uint64_t();
 
 #ifndef CHECK_RAC
@@ -132,7 +132,7 @@ uint64_t tls_counter::accumulator;
 thread_local tls_counter tls_counter::tls;
 
 HEDLEY_NEVER_INLINE
-uint64_t tls_add(size_t iters) {
+uint64_t tls_add(size_t iters, size_t id) {
     while (iters--) {
         tls_counter::increment();
     }
@@ -141,7 +141,7 @@ uint64_t tls_add(size_t iters) {
 
 static volatile uint64_t plain_counter;
 // racy
-uint64_t plain_add(size_t iters) {
+uint64_t plain_add(size_t iters, size_t id) {
     uint64_t rac_count = 0;
     IF_RAC(uint64_t last = plain_counter - 1;)
     while (iters--) {
@@ -149,6 +149,21 @@ uint64_t plain_add(size_t iters) {
         IF_RAC(rac_count += (cur == last + 1); last = cur;)
     }
     return rac_count;
+}
+
+static constexpr size_t NUM_FS_COUNTERS = 64;
+// Deterministic packed false-sharing.
+alignas(64) static volatile uint8_t fs_counters[NUM_FS_COUNTERS];
+uint64_t fs_add(size_t iters, size_t id) {
+    if (id >= NUM_FS_COUNTERS) {
+        error(EXIT_FAILURE, errno, "thread count exceeds structure %ld>=%ld",
+              id, NUM_FS_COUNTERS);
+    }
+    fs_counters[id] = 0;
+    while (iters--) {
+        fs_counters[id]++;
+    }
+    return fs_counters[id] != (iters & 0xff);
 }
 
 /**
@@ -274,7 +289,7 @@ struct adaptor {
     static T lock;
     static uint64_t counter;
 
-    static uint64_t bench(size_t iters) {
+    static uint64_t bench(size_t iters, size_t id) {
         uint64_t rac_count = 0;
         IF_RAC(uint64_t last = counter - 1;)
         while (iters--) {
@@ -304,13 +319,13 @@ test_func make_from_lock(const char *name, const char* desc = "desc") {
 
 template <typename T, T* O>
 test_func make_from_type(const char *name) {
-    return { [](size_t i) { return bench_template(*O, i); } , name , "desc" , []{ return O->read(); } };
+    return { [](size_t i, size_t id) { return bench_template(*O, i); } , name , "desc" , []{ return O->read(); } };
 }
 
 template <typename T>
 test_func make_unchecked(const char *name) {
     static T counter;
-    return { [](size_t i) {
+    return { [](size_t i, size_t id) {
         return bench_template(counter, i);
     }
     , name , "desc" , nullptr };
@@ -318,6 +333,7 @@ test_func make_unchecked(const char *name) {
 
 std::vector<test_func> ALL_FUNCS = {
         {plain_add                                      , "plain add"  , "desc" , nullptr }                             ,
+        {fs_add                                         , "fs add"  , "desc" , nullptr }                             ,
         {tls_add                                        , "tls add"    , "desc" , tls_counter::read }                   ,
         make_from_type<atomic_add_counter, &atomic_counter>("atomic add"),
         make_from_type<atomic_cas_counter, &cas_counter>("cas add"),
@@ -572,7 +588,7 @@ struct test_thread {
             uint64_t reacquires = 0;
             auto t0             = CLOCK::now();
             do {
-                reacquires += f(iters);
+                reacquires += f(iters, id);
                 result.total_iters += iters;
             } while (now_nanos() < deadline);
             auto t1             = CLOCK::now();
