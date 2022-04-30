@@ -151,6 +151,21 @@ uint64_t plain_add(size_t iters, size_t id) {
     return rac_count;
 }
 
+static constexpr size_t NUM_FS_COUNTERS = 64;
+// Deterministic packed false-sharing.
+alignas(64) static volatile uint8_t fs_counters[NUM_FS_COUNTERS];
+uint64_t fs_add(size_t iters, size_t id) {
+    if (id >= NUM_FS_COUNTERS) {
+        error(EXIT_FAILURE, errno, "thread count exceeds structure %ld>=%ld",
+              id, NUM_FS_COUNTERS);
+    }
+    fs_counters[id] = 0;
+    while (iters--) {
+        fs_counters[id]++;
+    }
+    return fs_counters[id] != (iters & 0xff);
+}
+
 /**
  * Simple counter which just uses a relaxed std::atomic increment.
  */
@@ -318,6 +333,7 @@ test_func make_unchecked(const char *name) {
 
 std::vector<test_func> ALL_FUNCS = {
         {plain_add                                      , "plain add"  , "desc" , nullptr }                             ,
+        {fs_add                                         , "fs add"  , "desc" , nullptr }                             ,
         {tls_add                                        , "tls add"    , "desc" , tls_counter::read }                   ,
         make_from_type<atomic_add_counter, &atomic_counter>("atomic add"),
         make_from_type<atomic_cas_counter, &cas_counter>("cas add"),
